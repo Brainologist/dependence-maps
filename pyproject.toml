@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dependence-maps"
+version = "0.1.1"
+description = "Dependence maps: signed, standardized deviations of the empirical copula from independence"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Ivan Medovikov"}]
+keywords = ["copula", "dependence", "empirical copula", "independence test",
+            "nonparametric statistics", "visualization", "tail dependence"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = ["numpy>=1.22", "scipy>=1.8", "matplotlib>=3.5"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.4"]
+test = ["pytest>=7", "pandas>=1.4"]
+
+[project.urls]
+Homepage = "https://github.com/Brainologist/dependence-maps"
+Source = "https://github.com/Brainologist/dependence-maps"
+Issues = "https://github.com/Brainologist/dependence-maps/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
