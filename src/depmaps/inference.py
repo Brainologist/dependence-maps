@@ -53,6 +53,16 @@ def _lagged_cov(Mc: np.ndarray, h: int) -> np.ndarray:
     return Mc[:-h].T @ Mc[h:] / n
 
 
+def _cross_cov_fft(Mc: np.ndarray, max_lag: int) -> np.ndarray:
+    """Gamma(h)[i, j] = n^{-1} sum_t Mc[t, i] Mc[t + h, j] for h = 0..max_lag, via FFT."""
+    n, g = Mc.shape
+    nfft = 1 << int(np.ceil(np.log2(2 * n - 1)))
+    F = np.fft.rfft(Mc, n=nfft, axis=0)                     # (nfft/2+1, g)
+    # out[h, i, j] = sum_t Mc[t, i] Mc[t + h, j]  <=>  correlate column i with column j
+    cc = np.fft.irfft(np.conj(F)[:, :, None] * F[:, None, :], n=nfft, axis=0)
+    return cc[: max_lag + 1] / n
+
+
 def null_covariance(dm: DependenceMap) -> np.ndarray:
     """Null correlation matrix of vec(Z) (row-major over the grid)."""
     if dm.kappa is None:
@@ -61,16 +71,18 @@ def null_covariance(dm: DependenceMap) -> np.ndarray:
     if cells > MAX_HAC_CELLS:
         raise ValueError(
             f"the HAC Gaussian null needs a dense {cells}x{cells} covariance matrix; "
-            f"use a grid with at most {MAX_HAC_CELLS} cells (e.g. 49x49) or method='shift'"
+            f"use a grid with at most {MAX_HAC_CELLS} cells (e.g. 50x50) or method='shift'"
         )
     if dm._A is None or dm._B is None:
         raise ValueError("map was computed with keep_indicators=False")
-    Ac = dm._A - dm.a
-    Bc = dm._B - dm.b
-    S = np.kron(_lagged_cov(Ac, 0), _lagged_cov(Bc, 0))
-    for h, w in zip(range(1, dm.max_lag + 1), bartlett_weights(dm.max_lag)):
-        GA, GB = _lagged_cov(Ac, h), _lagged_cov(Bc, h)
-        S += w * (np.kron(GA, GB) + np.kron(GA.T, GB.T))
+    L = dm.max_lag
+    GA = _cross_cov_fft(dm._A - dm.a, L)   # (L+1, ga, ga)
+    GB = _cross_cov_fft(dm._B - dm.b, L)   # (L+1, gb, gb)
+    w = np.concatenate([[0.5], bartlett_weights(L)]) if L >= 1 else np.array([0.5])
+    ga, gb = GA.shape[1], GB.shape[1]
+    # S = sum_h w_h (GA(h) kron GB(h) + GA(h)^T kron GB(h)^T), lag 0 counted once
+    T = np.einsum("h,hij,hkl->ikjl", w, GA, GB).reshape(ga * gb, ga * gb)
+    S = T + T.T
     d = np.sqrt(np.clip(np.diag(S), 1e-300, None))
     return S / np.outer(d, d)
 
@@ -87,12 +99,17 @@ def _max_abs_z_from_B(dm: DependenceMap, Bp: np.ndarray) -> float:
 def null_max_distribution(
     dm: DependenceMap,
     method: str = "gaussian",
-    n_sim: int = 2000,
+    n_sim: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
     min_shift: Optional[int] = None,
 ) -> np.ndarray:
-    """Draws of max |Z| over the grid under the null of independence."""
+    """Draws of max |Z| over the grid under the null of independence.
+
+    ``n_sim`` defaults to 10,000 Gaussian draws and 2,000 permutations or shifts.
+    """
     rng = np.random.default_rng(rng)
+    if n_sim is None:
+        n_sim = 10000 if method == "gaussian" else 2000
     ga, gb = dm.a.size, dm.b.size
 
     if method == "gaussian":
@@ -144,7 +161,7 @@ def simultaneous_band(
     dm: DependenceMap,
     alpha: float = 0.05,
     method: str = "gaussian",
-    n_sim: int = 2000,
+    n_sim: Optional[int] = None,
     rng=None,
     min_shift: Optional[int] = None,
 ) -> float:

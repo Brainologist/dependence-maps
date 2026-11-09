@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dependence-maps"
-version = "0.1.1"
+version = "0.2.0"
 description = "Dependence maps: signed, standardized deviations of the empirical copula from independence"
 readme = "README.md"
 requires-python = ">=3.9"

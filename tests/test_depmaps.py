@@ -296,3 +296,165 @@ def test_hac_gaussian_refuses_huge_grids():
     dm = dpm.dependence_map(rng.random(3000), rng.random(3000), grid=60, serial="hac", max_lag=5)
     with pytest.raises(ValueError, match="shift"):
         dm.simultaneous_band(method="gaussian", n_sim=10)
+
+
+# ---- v0.2.0: MSE lag rule, FFT HAC covariance, strata -------------------------
+
+def _ar1(n, b, rng):
+    e = rng.standard_normal(n + 200)
+    x = np.empty_like(e)
+    x[0] = e[0]
+    for t in range(1, e.size):
+        x[t] = b * x[t - 1] + e[t]
+    return x[200:]
+
+
+def test_mse_lag_grows_with_persistence_and_is_one_for_white_noise():
+    rng = np.random.default_rng(11)
+    lags = []
+    for b in (0.0, 0.5, 0.9):
+        dm = dpm.dependence_map(_ar1(2000, b, rng), _ar1(2000, b, rng), grid=9, serial="hac")
+        lags.append(dm.max_lag)
+    assert lags[0] <= 3 < lags[1] < lags[2]
+    # much longer than the Andrews AR(1) plug-in for persistent series
+    x, y = _ar1(2000, 0.9, rng), _ar1(2000, 0.9, rng)
+    assert dpm.dependence_map(x, y, grid=9, serial="hac").max_lag > 3 * dpm.dependence_map(
+        x, y, grid=9, serial="hac", max_lag="andrews").max_lag
+
+
+def test_fft_hac_covariance_matches_direct_sum():
+    from depmaps.core import bartlett_weights
+    rng = np.random.default_rng(12)
+    x, y = _ar1(1500, 0.7, rng), _ar1(1500, 0.7, rng)
+    dm = dpm.dependence_map(x, y, grid=5, serial="hac", max_lag=25)
+    Ac, Bc = dm._A - dm.a, dm._B - dm.b
+    n = dm.n
+
+    def lc(M, h):
+        return M.T @ M / n if h == 0 else M[:-h].T @ M[h:] / n
+
+    S = np.kron(lc(Ac, 0), lc(Bc, 0))
+    for h, w in zip(range(1, 26), bartlett_weights(25)):
+        S += w * (np.kron(lc(Ac, h), lc(Bc, h)) + np.kron(lc(Ac, h).T, lc(Bc, h).T))
+    d = np.sqrt(np.diag(S))
+    np.testing.assert_allclose(dpm.null_covariance(dm), S / np.outer(d, d), atol=1e-12)
+    # unit-diagonal normalization is consistent with kappa
+    np.testing.assert_allclose(np.diag(S).reshape(5, 5) / np.outer(dm.a * (1 - dm.a), dm.b * (1 - dm.b)),
+                               dm.kappa, atol=1e-10)
+
+
+def test_strata_remove_shared_deterministic_cycle():
+    rng = np.random.default_rng(13)
+    n = 24 * 200
+    hour = np.arange(n) % 24
+    cycle = 2.0 * np.cos(2 * np.pi * hour / 24)
+    x = cycle + _ar1(n, 0.5, rng)
+    y = cycle + _ar1(n, 0.5, rng)
+    raw = dpm.dependence_map(x, y, grid=9)
+    adj = dpm.dependence_map(x, y, grid=9, strata=hour)
+    assert raw.max_abs_z > 10            # the shared cycle dominates the raw map
+    assert adj.max_abs_z < 5             # standardizing within hours removes it
+    # strata may also be given as column names of a DataFrame
+    import pandas as pd
+    df = pd.DataFrame({"x": x, "y": y, "h": hour})
+    np.testing.assert_allclose(dpm.dependence_map("x", "y", data=df, grid=9, strata="h").z, adj.z)
+
+
+def test_small_strata_do_not_bias_the_map():
+    # many small strata of unequal size: the adjusted map must be centred under independence
+    rng = np.random.default_rng(14)
+    n = 3000
+    strata = np.repeat(np.arange(600), rng.integers(5, 16, 600))[:n]
+    zs = []
+    for _ in range(150):
+        x, y = rng.standard_normal(n), rng.standard_normal(n)
+        zs.append(dpm.dependence_map(x, y, grid=[0.1, 0.5, 0.9], strata=strata).z)
+    assert np.abs(np.mean(zs, axis=0)).max() < 0.25
+
+
+def test_seasonal_adjust_single_factor_is_within_group_standardization():
+    x = np.array([1.0, 3.0, 10.0, 30.0, 5.0])
+    s = np.array([0, 0, 1, 1, 2])
+    np.testing.assert_allclose(dpm.seasonal_adjust(x, s), [-1 / np.sqrt(2), 1 / np.sqrt(2), -1 / np.sqrt(2), 1 / np.sqrt(2), 0.0],
+                               atol=1e-12)
+
+
+def test_seasonal_adjust_removes_additive_effects():
+    rng = np.random.default_rng(15)
+    n = 24 * 400
+    hour, month = np.arange(n) % 24, (np.arange(n) // (24 * 30))
+    x = 2 * np.cos(2 * np.pi * hour / 24) + 0.5 * month + rng.standard_normal(n)
+    e = dpm.seasonal_adjust(x, [hour, month])
+    for f in (hour, month):
+        means = np.bincount(f, weights=e) / np.bincount(f)
+        assert np.abs(means).max() < 0.05
+
+
+def test_fourier_regressors_remove_smooth_cycle_within_months():
+    # a smooth annual cycle varies within months; month effects alone leave a shared
+    # residual (the map is biased), adding annual harmonics removes it
+    rng = np.random.default_rng(16)
+    n = 24 * 365 * 2
+    t = np.arange(n)
+    hour, day = t % 24, t // 24
+    month = day // 30
+    season = np.cos(2 * np.pi * hour / 24) + 3.0 * np.cos(2 * np.pi * day / 365.25)
+    zm, zf = [], []
+    for _ in range(20):
+        x, y = season + _ar1(n, 0.5, rng), season + _ar1(n, 0.5, rng)
+        zm.append(dpm.dependence_map(x, y, grid=[0.25, 0.5, 0.75], strata=[hour, month]).z.mean())
+        zf.append(dpm.dependence_map(x, y, grid=[0.25, 0.5, 0.75], strata=[hour, month],
+                                     regressors=dpm.fourier(day, 365.25, 2)).z.mean())
+    assert np.mean(zm) > 1.0
+    assert abs(np.mean(zf)) < 0.3
+
+
+def test_fourier_shape_and_regressor_checks():
+    F = dpm.fourier(np.arange(10), 5.0, 3)
+    assert F.shape == (10, 6)
+    np.testing.assert_allclose(F[:, 0], np.cos(2 * np.pi * np.arange(10) / 5))
+    with pytest.raises(ValueError):
+        dpm.dependence_map(np.arange(20.0), np.arange(20.0)[::-1], regressors=np.arange(20.0))
+
+
+def test_seasonal_scaling_is_order_independent():
+    rng = np.random.default_rng(17)
+    n = 24 * 300
+    hour, month = np.arange(n) % 24, np.arange(n) // (24 * 30)
+    x = (1 + 0.5 * np.cos(2 * np.pi * hour / 24)) * (1 + 0.1 * month) * rng.standard_normal(n)
+    e1 = dpm.seasonal_adjust(x, [hour, month])
+    e2 = dpm.seasonal_adjust(x, [month, hour])
+    np.testing.assert_allclose(e1, e2, atol=5e-3)
+    for f in (hour, month):
+        rms = np.array([np.sqrt(np.mean(e1[f == k] ** 2)) for k in np.unique(f)])
+        assert np.abs(np.log(rms)).max() < 2e-4
+
+
+def test_seasonal_scaling_converges_with_nested_factors():
+    # the calendar month enters both factors (as in hour x weekend x month and month of
+    # the sample); the scale model must still converge and be order independent
+    rng = np.random.default_rng(18)
+    n = 24 * 365 * 2
+    t = np.arange(n)
+    hour, day = t % 24, t // 24
+    ym = day // 30
+    moy = ym % 12
+    hwm = hour + 24 * moy
+    x = (1 + 0.4 * np.cos(2 * np.pi * hour / 24) * np.cos(2 * np.pi * moy / 12)) * (1 + 0.05 * ym) \
+        * _ar1(n, 0.9, rng) + np.cos(2 * np.pi * hour / 24)
+    e1 = dpm.seasonal_adjust(x, [hwm, ym], dpm.fourier(day, 365.25, 2))
+    e2 = dpm.seasonal_adjust(x, [ym, hwm], dpm.fourier(day, 365.25, 2))
+    np.testing.assert_allclose(e1, e2, atol=2e-3)
+    for f in (hwm, ym):
+        rms = np.sqrt(np.bincount(f, weights=e1 ** 2) / np.bincount(f))
+        assert np.abs(np.log(rms)).max() < 2e-4
+
+
+def test_mse_lag_handles_negative_autocorrelation():
+    # two independent AR(1) series with coefficient -0.9 have kappa = 5.3 at the median,
+    # as with +0.9; the lag rule must not collapse to L = 1
+    rng = np.random.default_rng(19)
+    x, y = _ar1(2000, -0.9, rng), _ar1(2000, -0.9, rng)
+    dm = dpm.dependence_map(x, y, grid=9, serial="hac")
+    assert dm.max_lag > 50
+    assert np.median(dm.kappa) > 2.5

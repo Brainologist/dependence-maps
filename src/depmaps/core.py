@@ -26,6 +26,20 @@ For serially dependent observations the pointwise null variance of
 sqrt(n)(C_n - ab) is sum_h gamma_A(h) gamma_B(h), where A_t, B_t are the
 centred indicator series. ``serial="hac"`` estimates the ratio of this
 long-run variance to the i.i.d. variance with Bartlett weights and rescales Z.
+Because the long-run variance factorizes into products of two independently
+estimated autocorrelation functions, the truncation lag can be much longer
+than for an ordinary HAC estimator; the default rule (:func:`mse_max_lag`)
+grows like n^(2/3).
+
+``strata`` (and optionally ``regressors``) removes deterministic seasonal
+patterns shared by the two series before the map is computed: each series is
+regressed on the main effects of the given factors (for example hour-of-day x
+weekend x calendar month, and month of the sample) and on smooth seasonal
+regressors such as annual harmonics (:func:`fourier`), and the residuals are
+scaled by a multiplicative scale model, so that their root mean square is one
+within the levels of every factor (:func:`seasonal_adjust`). The adjusted map is centred under
+independence only if the seasonal model captures the cycle shared by the two
+series; any shared seasonality left in the residuals biases it.
 """
 from __future__ import annotations
 
@@ -117,6 +131,142 @@ def andrews_max_lag(A: np.ndarray, B: np.ndarray) -> int:
     alpha = 4.0 * rho**2 / (1.0 - rho**2) ** 2
     L = int(np.ceil(1.1447 * (alpha * n) ** (1.0 / 3.0)))
     return max(1, min(L, n // 4))
+
+
+def _geometric_fit(r1: np.ndarray, r2: np.ndarray):
+    """Fit rho(l) = c r^l to lags 1 and 2 of each column, r = rho(2)/rho(1) clipped to
+    [-0.99, 0.99], so that alternating (negative) autocorrelations are allowed. Columns
+    with |rho(1)| <= 1e-3 are treated as serially uncorrelated (c = r = 0)."""
+    ok = np.abs(r1) > 1e-3
+    r = np.where(ok, np.clip(r2 / np.where(ok, r1, 1.0), -0.99, 0.99), 0.0)
+    c = np.where(r != 0, r1 / np.where(r != 0, r, 1.0), 0.0)
+    return c, r
+
+
+def mse_max_lag(A: np.ndarray, B: np.ndarray) -> int:
+    """Plug-in truncation lag that minimizes the asymptotic MSE of kappa-hat.
+
+    Under independence the Bartlett estimator of kappa = 1 + 2 sum rho_A rho_B
+    has bias about -2 S1 / (L + 1), S1 = sum_l l rho_A(l) rho_B(l), while the
+    part of its variance that grows with L is about (4/3) L G / n^2, where
+    G = sum_d g_A(d) g_B(d) and g(d) = sum_k rho(k) rho(k + d). The minimizer
+    is L = (6 S1^2 / G)^(1/3) n^(2/3). The autocorrelations are approximated by
+    geometric functions c r^l fitted to lags 1 and 2 of each indicator series
+    (:func:`_geometric_fit`; |r| <= 0.99), the sums S1 and G are truncated at
+    K = 20 / (1 - max |r|) lags, cells with G = 0 get lag 0, and the median of the
+    cell-wise lags over the grid is used, restricted to [1, n/4]. The median can be
+    too short when the serial dependence is confined to a few cells of the map.
+    """
+    n = A.shape[0]
+    rA, rB = _acf_columns(A, 2), _acf_columns(B, 2)
+    cA, qA = _geometric_fit(rA[0], rA[1])
+    cB, qB = _geometric_fit(rB[0], rB[1])
+    qmax = max(float(np.abs(qA).max()), float(np.abs(qB).max()))
+    K = int(min(n - 1, np.ceil(20.0 / max(1e-6, 1.0 - qmax))))
+    lag = np.arange(1, K + 1)
+    fA = cA[:, None] * qA[:, None] ** lag
+    fB = cB[:, None] * qB[:, None] ** lag
+
+    def _g(f):
+        full = np.concatenate([f[:, ::-1], np.ones((f.shape[0], 1)), f], axis=1)
+        m = 2 * full.shape[1]
+        F = np.fft.rfft(full, m, axis=1)
+        return np.fft.irfft(F * np.conj(F), m, axis=1)
+
+    G = _g(fA) @ _g(fB).T
+    S1 = (fA * lag) @ fB.T
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Lc = np.where(G > 0, (6.0 * S1**2 / G) ** (1.0 / 3.0), 0.0) * n ** (2.0 / 3.0)
+    L = int(np.ceil(np.median(Lc)))
+    return max(1, min(L, n // 4))
+
+
+def fourier(t, period: float, order: int = 2) -> np.ndarray:
+    """Harmonic regressors cos(2 pi k t / period), sin(2 pi k t / period),
+    k = 1, ..., order, as an (n, 2 * order) array. For an annual cycle in hourly
+    data use, for example, ``t`` = day of year and ``period`` = 365.25."""
+    t = np.asarray(t, dtype=float).ravel()
+    cols = []
+    for k in range(1, int(order) + 1):
+        w = 2.0 * np.pi * k * t / float(period)
+        cols += [np.cos(w), np.sin(w)]
+    return np.column_stack(cols)
+
+
+def seasonal_adjust(x: np.ndarray, factors=None, regressors=None, max_iter: int = 200,
+                    tol: float = 1e-4) -> np.ndarray:
+    """Remove deterministic seasonal patterns in location and scale.
+
+    ``factors`` is one array of labels or a list of them (e.g. ``[hour_x_weekend,
+    year_month]``); ``regressors`` is an optional (n,) or (n, k) array of smooth
+    seasonal regressors, e.g. annual harmonics from :func:`fourier`. The series is
+    regressed on an intercept, the main effects (dummy variables) of all factors
+    and the regressors, and the residuals are then divided by a multiplicative
+    scale model with one term per seasonal factor, fitted by iterative
+    proportional scaling: the residuals are divided by their root mean square
+    within the levels of each factor in turn, until every within-level root mean
+    square is within ``tol`` (on the log scale) of one, or ``max_iter`` passes.
+    The result does not depend on the order of the factors. With a single factor
+    and no regressors this is standardization within groups, (x - mean_s) / sd_s.
+    Levels with a single observation or no spread give 0.
+
+    Interactions are modelled by passing a combined factor (for example hour x
+    weekend x calendar month as one array of labels). The adjusted map is centred
+    under independence only if the location model spans the seasonal pattern
+    shared by the two series; shared seasonality left in the residuals induces a
+    bias that grows like sqrt(n).
+
+    Ranks computed within small groups are deliberately not used: the pooled
+    indicators would then have group-dependent proportions that move together in
+    X and Y and bias the map under independence.
+    """
+    x = np.asarray(x, dtype=float)
+    n = x.shape[0]
+    if factors is None:
+        parts = []
+    else:
+        parts = factors if isinstance(factors, (list, tuple)) else [factors]
+    codes = [np.unique(np.asarray(f).astype(str), return_inverse=True)[1] for f in parts]
+    cols = [np.ones(n)]
+    for c in codes:
+        k = int(c.max()) + 1
+        D = np.zeros((n, k))
+        D[np.arange(n), c] = 1.0
+        cols.append(D[:, 1:])
+    if regressors is not None:
+        R = np.asarray(regressors, dtype=float)
+        R = R.reshape(n, -1) if R.ndim == 1 else R
+        if R.shape[0] != n:
+            raise ValueError("regressors must have the same length as x")
+        cols.append(R)
+    X = np.column_stack(cols)
+    coef, *_ = np.linalg.lstsq(X, x, rcond=None)
+    e = x - X @ coef
+    if not codes:
+        sd = e.std(ddof=1)
+        return e / sd if sd > 0 else np.zeros_like(e)
+    if len(codes) == 1:
+        c = codes[0]
+        cnt = np.bincount(c)
+        m = np.bincount(c, weights=e) / cnt
+        sd = np.sqrt(np.bincount(c, weights=(e - m[c]) ** 2) / np.maximum(cnt - 1, 1))[c]
+        return np.where(sd > 0, e / np.where(sd > 0, sd, 1.0), 0.0)
+    # multiplicative scale model, E(e^2) = prod_j s_j(level_j)^2, fitted by iterative
+    # proportional scaling of e^2: divide by the root mean square within the levels of
+    # each factor in turn until all are equal to one (within tol on the log scale). The
+    # fixed point does not depend on the order of the factors.
+    for _ in range(max_iter):
+        worst = 0.0
+        for c in codes:
+            rms = np.sqrt(np.bincount(c, weights=e ** 2) / np.bincount(c))
+            ok = rms > 0
+            if ok.any():
+                worst = max(worst, float(np.max(np.abs(np.log(rms[ok])))))
+            r = rms[c]
+            e = np.where(r > 0, e / np.where(r > 0, r, 1.0), 0.0)
+        if worst < tol:
+            break
+    return e
 
 
 def bartlett_weights(max_lag: int) -> np.ndarray:
@@ -263,6 +413,8 @@ def dependence_map(
     data=None,
     serial: Optional[str] = None,
     max_lag: Union[int, str, None] = "auto",
+    strata=None,
+    regressors=None,
     keep_indicators: bool = True,
 ) -> DependenceMap:
     """Compute a signed, standardized dependence map.
@@ -277,18 +429,30 @@ def dependence_map(
     serial : None (i.i.d. standardization) or "hac" (Bartlett long-run
         variance correction for serially dependent data).
     max_lag : truncation lag for ``serial="hac"``. "auto" (default) uses the
-        Andrews (1991) AR(1) plug-in rule (:func:`andrews_max_lag`); "nw"
-        uses the Newey-West rule of thumb (:func:`default_max_lag`), which is
-        far too short for persistent data such as hourly prices; an integer
-        sets the lag directly. Because the long-run variance of seasonal
-        series may not settle as the lag grows, results should be reported
-        for several lags.
+        MSE-optimal plug-in rule for kappa-hat (:func:`mse_max_lag`), which
+        grows like n^(2/3); "andrews" uses the Andrews (1991) AR(1) plug-in
+        applied to the products A_t B_t (:func:`andrews_max_lag`), which is
+        too short for persistent series; "nw" uses the Newey-West rule of
+        thumb (:func:`default_max_lag`); an integer sets the lag directly.
+        With deterministic seasonal patterns the long-run variance is not
+        well defined; use ``strata`` and report results for several lags.
+    strata : optional seasonal factors (array, list of arrays, or column
+        name(s) of ``data``), e.g. ``[hour_x_weekend_x_month, year_month]``. Each
+        series is adjusted by :func:`seasonal_adjust` (main effects of the factors
+        and ``regressors`` in location, scale within levels) before the map is
+        computed. Removes shared deterministic seasonality, provided the model
+        captures it; the map then describes the dependence of the adjusted series.
+    regressors : optional (n,) or (n, k) array of smooth seasonal regressors
+        used together with ``strata``, e.g. ``fourier(day_of_year, 365.25, 2)``.
     keep_indicators : store indicator matrices, needed by
         :func:`depmaps.simultaneous_band` and the permutation/shift methods.
     """
     if data is not None:
         xlab, ylab = str(x), str(y)
         x, y = data[x], data[y]
+        if strata is not None:
+            names = strata if isinstance(strata, (list, tuple)) else [strata]
+            strata = [data[s] if isinstance(s, str) else s for s in names]
     if y is None:
         raise ValueError("y is required")
     ix, iy = getattr(x, "index", None), getattr(y, "index", None)
@@ -300,6 +464,19 @@ def dependence_map(
         xlab, ylab = xlab_, ylab_
     if xv.shape != yv.shape:
         raise ValueError("x and y must have the same length")
+
+    if strata is not None:
+        parts = strata if isinstance(strata, (list, tuple)) else [strata]
+        parts = [np.asarray(s).ravel() for s in parts]
+        if any(p.shape[0] != xv.shape[0] for p in parts):
+            raise ValueError("strata must have the same length as x and y")
+    if regressors is not None:
+        if strata is None:
+            raise ValueError("regressors are used only together with strata")
+        regs = np.asarray(regressors, dtype=float)
+        regs = regs.reshape(-1, 1) if regs.ndim == 1 else regs
+        if regs.shape[0] != xv.shape[0]:
+            raise ValueError("regressors must have the same length as x and y")
 
     ok = np.isfinite(xv) & np.isfinite(yv)
     n_dropped = int((~ok).sum())
@@ -323,6 +500,10 @@ def dependence_map(
     else:
         gx = gy = make_grid(grid)
 
+    if strata is not None:
+        parts = [p[ok] for p in parts]
+        rg = regs[ok] if regressors is not None else None
+        xv, yv = seasonal_adjust(xv, parts, rg), seasonal_adjust(yv, parts, rg)
     U, V = pseudo_obs(xv), pseudo_obs(yv)
     A, B = _indicators(U, gx), _indicators(V, gy)
     a, b = A.mean(axis=0), B.mean(axis=0)
@@ -354,6 +535,8 @@ def dependence_map(
         if serial != "hac":
             raise ValueError("serial must be None or 'hac'")
         if max_lag is None or max_lag == "auto":
+            L = mse_max_lag(A, B)
+        elif max_lag == "andrews":
             L = andrews_max_lag(A, B)
         elif max_lag == "nw":
             L = default_max_lag(n)
@@ -362,7 +545,7 @@ def dependence_map(
             if L < 0:
                 raise ValueError("max_lag must be non-negative")
         else:
-            raise ValueError("max_lag must be 'auto', 'nw' or a non-negative integer")
+            raise ValueError("max_lag must be 'auto', 'andrews', 'nw' or a non-negative integer")
         if L >= n:
             raise ValueError("max_lag must be smaller than the number of observations")
         if L >= 1:

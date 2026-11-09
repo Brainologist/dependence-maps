@@ -106,9 +106,12 @@ dm.global_pvalue                                 # sup-norm test of independence
 
 # serially dependent data
 dm = dpm.dependence_map("load", "price", data=df, grid=19,
-                        serial="hac")               # lag by the Andrews (1991) rule
+                        serial="hac")               # MSE-optimal lag, grows like n^(2/3)
 dm = dpm.dependence_map("load", "price", data=df, grid=19,
                         serial="hac", max_lag=168)  # or a fixed lag
+dm = dpm.dependence_map("load", "price", data=df, grid=19, serial="hac",
+                        strata=["hour_weekend_month", "year_month"],     # seasonal factors
+                        regressors=dpm.fourier(df["day_of_year"], 365.25, 2))  # annual harmonics
 dm.simultaneous_band(method="gaussian")          # HAC Gaussian null
 dm.simultaneous_band(method="shift")             # circular shifts of Y
 ```
@@ -124,9 +127,11 @@ Simultaneous critical values can be computed in four ways:
 | `permutation` | random permutations of Y | i.i.d. data, exact under ties |
 | `shift` | random circular shifts of Y | stationary series |
 
-The HAC Gaussian null uses a dense covariance matrix over all pairs of grid cells and is therefore limited to 2,500 cells (a 49×49 grid). For finer grids, use `shift`.
+The HAC Gaussian null uses a dense covariance matrix over all pairs of grid cells and is therefore limited to 2,500 cells (a 50×50 grid). For finer grids, use `shift`.
 
-Under serial dependence, the pointwise null variance of √n(Cₙ − uv) equals Σ_h γ_A(h)γ_B(h), where A_t = 1{U_t ≤ u} − u and B_t = 1{V_t ≤ v} − v are centred indicator series. With `serial="hac"`, the ratio κ(u, v) of this long-run variance to its i.i.d. counterpart is estimated with Bartlett weights and the map reports Z/√κ. The truncation lag is chosen by the AR(1) plug-in rule of Andrews (1991) applied to A_t B_t. The Newey–West rule of thumb is available as `max_lag="nw"`, but it is much too short for persistent series such as hourly prices. For persistent and seasonal series κ can be large and may keep growing with the lag, so results should be reported for several lags.
+Under serial dependence, the pointwise null variance of √n(Cₙ − uv) equals Σ_h γ_A(h)γ_B(h), where A_t = 1{U_t ≤ u} − u and B_t = 1{V_t ≤ v} − v are centred indicator series. With `serial="hac"`, the ratio κ(u, v) of this long-run variance to its i.i.d. counterpart is estimated with Bartlett weights and the map reports Z/√κ. Because κ factorizes into products of two autocorrelation functions estimated from independent series, its estimator tolerates much longer truncation lags than an ordinary HAC estimator. The default lag (`max_lag="auto"`) minimizes the approximate mean squared error of κ̂ and grows like n^(2/3); the AR(1) plug-in rule of Andrews (1991) applied to A_t B_t (`max_lag="andrews"`) and the Newey–West rule of thumb (`max_lag="nw"`) are available but select lags that are too short for persistent series.
+
+When the two series share deterministic cycles (hour of day, season), κ is not defined: κ̂ keeps growing with the lag, and circular shifts are distorted. Passing `strata` (and optionally `regressors`) adjusts each series for seasonal factors before the map is computed, for example hour × weekend × calendar month (so that the daily profile can change with the season) and the month of the sample, plus annual harmonics from `fourier`. The series is regressed on the dummies and regressors, and the residuals are divided by a multiplicative scale model fitted by iterative proportional scaling, so that their root mean square is one within every level of every factor, whatever the order of the factors. The map then describes the dependence of the seasonally adjusted series. It is centred under independence only if the seasonal model captures the cycles the two series share; shared seasonality left in the residuals (an annual cycle that varies within months, a daily profile that changes with the season) biases the map, increasingly so as n grows, so it is worth checking how the map changes with the seasonal model. (Ranking within small strata is avoided, as it biases the pooled map.)
 
 ## Tests
 

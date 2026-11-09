@@ -1,5 +1,6 @@
 """Dependence maps: signed standardized deviations of the empirical copula from independence."""
-from .core import DependenceMap, dependence_map, make_grid, pseudo_obs, default_max_lag, andrews_max_lag
+from .core import (DependenceMap, dependence_map, make_grid, pseudo_obs, seasonal_adjust, fourier,
+                   default_max_lag, andrews_max_lag, mse_max_lag)
 from .inference import null_covariance, null_max_distribution, simultaneous_band
 from .plotting import DEPMAP_CMAP, plot_map, rank_scatter
 
@@ -8,8 +9,11 @@ __all__ = [
     "dependence_map",
     "make_grid",
     "pseudo_obs",
+    "seasonal_adjust",
+    "fourier",
     "default_max_lag",
     "andrews_max_lag",
+    "mse_max_lag",
     "simultaneous_band",
     "null_max_distribution",
     "null_covariance",
@@ -18,4 +22,4 @@ __all__ = [
     "DEPMAP_CMAP",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

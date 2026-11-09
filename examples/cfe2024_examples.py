@@ -94,7 +94,7 @@ price = 35 + 0.08 * cold**2 + 0.10 * hot**2 + price_noise
 dm = pair(temperature, price, "Simulated hourly temperature and power price",
           "example4_u_shape", xlabel="Temperature (u)", ylabel="Price (v)",
           serial="hac")
-print(f"  U-shape: plug-in lag = {dm.max_lag} h, median variance inflation = {np.median(dm.kappa):.1f}")
+print(f"  U-shape: truncation lag = {dm.max_lag} h, median variance inflation = {np.median(dm.kappa):.1f}")
 
 # 5. Clayton copula: lower-tail dependence -------------------------------------
 uv = clayton_copula(N, 2.0, rng=5)
